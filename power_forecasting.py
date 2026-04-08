@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,8 +24,8 @@ try:
     from sklearn.preprocessing import StandardScaler
 except ModuleNotFoundError as exc:
     raise SystemExit(
-        "必要なパッケージが不足しています。"
-        " `pip install -r requirements.txt` を実行してから再度お試しください。"
+        "Missing required core packages. "
+        "Run `.\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt` first."
     ) from exc
 
 
@@ -42,7 +43,7 @@ DEFAULT_WINDOW_SPECS = ("3step", "6step", "12step", "1D", "7D")
 class ModelSpec:
     family: str
     description: str
-    factory: Callable[[], object]
+    factory: Callable[[], object] | None = None
 
 
 def build_hgbt() -> HistGradientBoostingRegressor:
@@ -120,7 +121,7 @@ def build_lightgbm() -> object:
         from lightgbm import LGBMRegressor
     except ImportError as exc:
         raise ImportError(
-            "lightgbm が見つかりません。`pip install lightgbm` で追加してください。"
+            "lightgbm is not installed. Run `.\\.venv\\Scripts\\python.exe -m pip install lightgbm`."
         ) from exc
 
     return LGBMRegressor(
@@ -138,7 +139,7 @@ def build_xgboost() -> object:
         from xgboost import XGBRegressor
     except ImportError as exc:
         raise ImportError(
-            "xgboost が見つかりません。`pip install xgboost` で追加してください。"
+            "xgboost is not installed. Run `.\\.venv\\Scripts\\python.exe -m pip install xgboost`."
         ) from exc
 
     return XGBRegressor(
@@ -166,62 +167,26 @@ MODEL_SPECS: dict[str, ModelSpec] = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "UCI Individual Household Electric Power Consumption を使った"
-            "時系列予測サンプル"
-        ),
-        formatter_class=argparse.RawTextHelpFormatter,
+        description="Forecast Global_active_power with classical ML models, including XGBoost.",
     )
-    parser.add_argument(
-        "--data-path",
-        type=Path,
-        default=DEFAULT_DATA_PATH,
-        help="入力データのパス",
-    )
-    parser.add_argument(
-        "--freq",
-        default=DEFAULT_FREQ,
-        help="集約間隔。固定長の pandas 頻度文字列を指定 (例: 30min, 1h, 1D)",
-    )
-    parser.add_argument(
-        "--agg",
-        choices=("mean", "sum", "median"),
-        default=DEFAULT_AGG,
-        help="リサンプリング時の集約方法",
-    )
-    parser.add_argument(
-        "--target",
-        default=DEFAULT_TARGET,
-        help="予測対象カラム",
-    )
-    parser.add_argument(
-        "--model",
-        choices=tuple(MODEL_SPECS.keys()),
-        default="hgbt",
-        help="使用するモデル",
-    )
+    parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH, help="Path to household_power_consumption.txt")
+    parser.add_argument("--freq", default=DEFAULT_FREQ, help="Resample interval, for example 30min, 1h, or 1D.")
+    parser.add_argument("--agg", choices=("mean", "sum", "median"), default=DEFAULT_AGG, help="Resample aggregation.")
+    parser.add_argument("--target", default=DEFAULT_TARGET, help="Target column to forecast.")
+    parser.add_argument("--model", choices=tuple(MODEL_SPECS.keys()), default="hgbt", help="Forecast model.")
     parser.add_argument(
         "--forecast-horizon",
         default=DEFAULT_FORECAST_HORIZON,
-        help="未来予測の期間。freq に合わせてステップ数へ変換される (例: 24h, 7D)",
+        help="Future forecast horizon. Converted into steps from --freq, for example 24h or 7D.",
     )
     parser.add_argument(
         "--test-size",
         type=float,
         default=DEFAULT_TEST_SIZE,
-        help="テストデータの割合 (0 < test_size < 1)",
+        help="Holdout ratio. Must satisfy 0 < test_size < 1.",
     )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("."),
-        help="予測結果の保存先",
-    )
-    parser.add_argument(
-        "--list-models",
-        action="store_true",
-        help="利用可能なモデル一覧だけを表示して終了",
-    )
+    parser.add_argument("--output-dir", type=Path, default=Path("."), help="Directory where outputs will be saved.")
+    parser.add_argument("--list-models", action="store_true", help="Print available models and exit.")
     return parser.parse_args()
 
 
@@ -235,7 +200,7 @@ def get_fixed_freq_delta(freq: str) -> pd.Timedelta:
         nanos = offset.nanos
     except ValueError as exc:
         raise ValueError(
-            f"`{freq}` は固定長の頻度ではありません。`30min`, `1h`, `1D` のような値を指定してください。"
+            f"`{freq}` is not a fixed-width frequency. Use values like `30min`, `1h`, or `1D`."
         ) from exc
     return pd.Timedelta(nanos, unit="ns")
 
@@ -274,35 +239,25 @@ def horizon_to_steps(horizon: str, freq_delta: pd.Timedelta) -> int:
     duration = pd.Timedelta(horizon)
     steps = duration / freq_delta
     if steps < 1:
-        raise ValueError(
-            f"forecast horizon `{horizon}` は freq より短いため 1 ステップ未満です。"
-        )
+        raise ValueError(f"Forecast horizon `{horizon}` is shorter than a single `{freq_delta}` step.")
     if not float(steps).is_integer():
-        raise ValueError(
-            f"forecast horizon `{horizon}` は freq `{freq_delta}` の整数倍にしてください。"
-        )
+        raise ValueError(f"Forecast horizon `{horizon}` must be an integer multiple of `{freq_delta}`.")
     return int(steps)
 
 
 def print_models() -> None:
     print("Available models:")
     for name, spec in MODEL_SPECS.items():
-        print(f"  - {name:<14} [{spec.family:<11}] {spec.description}")
+        print(f"  - {name:<14} [{spec.family:<16}] {spec.description}")
 
 
 def load_household_power_data(data_path: Path) -> pd.DataFrame:
     if not data_path.exists():
         raise FileNotFoundError(
-            f"{data_path} が見つかりません。UCI から household_power_consumption.txt を配置してください。"
+            f"{data_path} was not found. Download household_power_consumption.txt from UCI and place it here."
         )
 
-    df = pd.read_csv(
-        data_path,
-        sep=";",
-        na_values=["?"],
-        low_memory=False,
-    )
-
+    df = pd.read_csv(data_path, sep=";", na_values=["?"], low_memory=False)
     df["datetime"] = pd.to_datetime(
         df["Date"] + " " + df["Time"],
         format="%d/%m/%Y %H:%M:%S",
@@ -314,8 +269,7 @@ def load_household_power_data(data_path: Path) -> pd.DataFrame:
     df = df.set_index("datetime").sort_index()
     df = df[~df.index.duplicated(keep="last")]
 
-    numeric_cols = [col for col in df.columns]
-    for col in numeric_cols:
+    for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df
@@ -329,7 +283,7 @@ def resample_data(df: pd.DataFrame, freq: str, agg: str) -> pd.DataFrame:
     elif agg == "median":
         resampled = df.resample(freq).median()
     else:
-        raise ValueError(f"Unsupported agg: {agg}")
+        raise ValueError(f"Unsupported aggregation: {agg}")
 
     return resampled.interpolate(method="time").ffill().bfill()
 
@@ -357,12 +311,8 @@ def make_features(
         out[f"{target_col}_lag_{label}"] = out[target_col].shift(steps)
 
     for label, steps in window_specs:
-        out[f"{target_col}_roll_mean_{label}"] = (
-            out[target_col].shift(1).rolling(steps).mean()
-        )
-        out[f"{target_col}_roll_std_{label}"] = (
-            out[target_col].shift(1).rolling(steps).std()
-        )
+        out[f"{target_col}_roll_mean_{label}"] = out[target_col].shift(1).rolling(steps).mean()
+        out[f"{target_col}_roll_std_{label}"] = out[target_col].shift(1).rolling(steps).std()
 
     exog_cols = [col for col in data.columns if col != target_col]
     for col in exog_cols:
@@ -372,10 +322,7 @@ def make_features(
 
 
 def build_model(model_name: str) -> object:
-    try:
-        return MODEL_SPECS[model_name].factory()
-    except KeyError as exc:
-        raise ValueError(f"Unknown model: {model_name}") from exc
+    return MODEL_SPECS[model_name].factory()
 
 
 def split_train_test(
@@ -384,11 +331,11 @@ def split_train_test(
     test_size: float,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
     if not 0 < test_size < 1:
-        raise ValueError("test_size は 0 と 1 の間で指定してください。")
+        raise ValueError("test_size must be between 0 and 1.")
 
     split_idx = int(len(feat_df) * (1 - test_size))
     if split_idx <= 0 or split_idx >= len(feat_df):
-        raise ValueError("学習データまたはテストデータが空になります。test_size を見直してください。")
+        raise ValueError("Train or test split became empty. Adjust test_size.")
 
     train_df = feat_df.iloc[:split_idx]
     test_df = feat_df.iloc[split_idx:]
@@ -397,17 +344,16 @@ def split_train_test(
     y_train = train_df[target_col]
     x_test = test_df.drop(columns=[target_col])
     y_test = test_df[target_col]
-
     return x_train, y_train, x_test, y_test
 
 
-def evaluate_predictions(y_true: pd.Series, y_pred: np.ndarray) -> dict[str, float]:
+def evaluate_predictions(y_true: pd.Series, y_pred: np.ndarray | pd.Series) -> dict[str, float]:
     mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     return {"mae": float(mae), "rmse": float(rmse)}
 
 
-def iterative_forecast(
+def iterative_forecast_sklearn(
     model: object,
     history: pd.DataFrame,
     target_col: str,
@@ -420,8 +366,7 @@ def iterative_forecast(
     future_preds: list[tuple[pd.Timestamp, float]] = []
 
     for _ in range(forecast_steps):
-        next_time = work.index[-1] + pd.tseries.frequencies.to_offset(freq)
-
+        next_time = work.index[-1] + to_offset(freq)
         next_row = work.iloc[-1:].copy()
         next_row.index = [next_time]
         next_row[target_col] = np.nan
@@ -436,6 +381,54 @@ def iterative_forecast(
         future_preds.append((next_time, y_next))
 
     return pd.DataFrame(future_preds, columns=["datetime", "forecast"]).set_index("datetime")
+
+
+def run_sklearn_pipeline(
+    args: argparse.Namespace,
+    resampled: pd.DataFrame,
+    lag_specs: list[tuple[str, int]],
+    window_specs: list[tuple[str, int]],
+    skipped_lags: list[str],
+    skipped_windows: list[str],
+    forecast_steps: int,
+) -> tuple[dict[str, float], pd.DataFrame, pd.DataFrame]:
+    if not lag_specs:
+        raise ValueError("No valid lag features were created. Check --freq.")
+    if not window_specs:
+        raise ValueError("No valid rolling features were created. Check --freq.")
+
+    print("Resolved lags:", ", ".join(f"{label}={steps}" for label, steps in lag_specs))
+    print("Resolved windows:", ", ".join(f"{label}={steps}" for label, steps in window_specs))
+    if skipped_lags:
+        print("Skipped lag specs:", ", ".join(skipped_lags))
+    if skipped_windows:
+        print("Skipped window specs:", ", ".join(skipped_windows))
+
+    feat_df = make_features(resampled, args.target, lag_specs, window_specs).dropna()
+    print("Feature shape:", feat_df.shape)
+
+    x_train, y_train, x_test, y_test = split_train_test(feat_df, args.target, args.test_size)
+    print("Train:", x_train.shape, y_train.shape)
+    print("Test :", x_test.shape, y_test.shape)
+
+    model = build_model(args.model)
+    print(f"Training model: {args.model} ({MODEL_SPECS[args.model].description})")
+    model.fit(x_train, y_train)
+
+    pred_test = model.predict(x_test)
+    metrics = evaluate_predictions(y_test, pred_test)
+
+    test_result = pd.DataFrame({"actual": y_test, "pred": pred_test}, index=y_test.index)
+    future_forecast = iterative_forecast_sklearn(
+        model=model,
+        history=resampled.copy(),
+        target_col=args.target,
+        lag_specs=lag_specs,
+        window_specs=window_specs,
+        forecast_steps=forecast_steps,
+        freq=args.freq,
+    )
+    return metrics, test_result, future_forecast
 
 
 def save_outputs(
@@ -455,7 +448,7 @@ def save_outputs(
 
     test_result.to_csv(pred_path)
     future_forecast.to_csv(forecast_path)
-    metrics_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     print("\nSaved files:")
     print(f"- {pred_path}")
@@ -465,67 +458,41 @@ def save_outputs(
 
 def main() -> None:
     args = parse_args()
-
     if args.list_models:
         print_models()
         return
 
     freq_delta = get_fixed_freq_delta(args.freq)
+    forecast_steps = horizon_to_steps(args.forecast_horizon, freq_delta)
     lag_specs, skipped_lags = resolve_specs(DEFAULT_LAG_SPECS, freq_delta)
     window_specs, skipped_windows = resolve_specs(DEFAULT_WINDOW_SPECS, freq_delta)
-    forecast_steps = horizon_to_steps(args.forecast_horizon, freq_delta)
-
-    if not lag_specs:
-        raise ValueError("有効なラグ特徴が 1 つも作れませんでした。freq を見直してください。")
-    if not window_specs:
-        raise ValueError("有効な移動窓特徴が 1 つも作れませんでした。freq を見直してください。")
 
     print("Loading data...")
     df = load_household_power_data(args.data_path)
     print("Raw shape:", df.shape)
 
     if args.target not in df.columns:
-        raise ValueError(f"target `{args.target}` がデータに存在しません。")
+        raise ValueError(f"Target column `{args.target}` was not found in the dataset.")
 
     resampled = resample_data(df, args.freq, args.agg)
     print(f"Resampled shape ({args.freq}, {args.agg}):", resampled.shape)
-    print("Resolved lags:", ", ".join(f"{label}={steps}" for label, steps in lag_specs))
-    print("Resolved windows:", ", ".join(f"{label}={steps}" for label, steps in window_specs))
 
-    if skipped_lags:
-        print("Skipped lag specs:", ", ".join(skipped_lags))
-    if skipped_windows:
-        print("Skipped window specs:", ", ".join(skipped_windows))
+    metrics, test_result, future_forecast = run_sklearn_pipeline(
+        args=args,
+        resampled=resampled,
+        lag_specs=lag_specs,
+        window_specs=window_specs,
+        skipped_lags=skipped_lags,
+        skipped_windows=skipped_windows,
+        forecast_steps=forecast_steps,
+    )
 
-    feat_df = make_features(resampled, args.target, lag_specs, window_specs).dropna()
-    print("Feature shape:", feat_df.shape)
-
-    x_train, y_train, x_test, y_test = split_train_test(feat_df, args.target, args.test_size)
-    print("Train:", x_train.shape, y_train.shape)
-    print("Test :", x_test.shape, y_test.shape)
-
-    model = build_model(args.model)
-    print(f"Training model: {args.model} ({MODEL_SPECS[args.model].description})")
-    model.fit(x_train, y_train)
-
-    pred_test = model.predict(x_test)
-    metrics = evaluate_predictions(y_test, pred_test)
     print(f"MAE : {metrics['mae']:.4f}")
     print(f"RMSE: {metrics['rmse']:.4f}")
 
-    test_result = pd.DataFrame({"actual": y_test, "pred": pred_test}, index=y_test.index)
     print("\nTest prediction sample:")
     print(test_result.head(20))
 
-    future_forecast = iterative_forecast(
-        model=model,
-        history=resampled.copy(),
-        target_col=args.target,
-        lag_specs=lag_specs,
-        window_specs=window_specs,
-        forecast_steps=forecast_steps,
-        freq=args.freq,
-    )
     print(f"\n=== Next {args.forecast_horizon} forecast ({forecast_steps} steps) ===")
     print(future_forecast)
 
