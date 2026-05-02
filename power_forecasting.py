@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import re
+import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -37,6 +39,11 @@ DEFAULT_FORECAST_HORIZON = "24h"
 DEFAULT_TEST_SIZE = 0.2
 DEFAULT_LAG_SPECS = ("1step", "2step", "3step", "6step", "12step", "1D", "2D", "7D")
 DEFAULT_WINDOW_SPECS = ("3step", "6step", "12step", "1D", "7D")
+UCI_DATA_URL = (
+    "https://archive.ics.uci.edu/static/public/235/"
+    "individual+household+electric+power+consumption.zip"
+)
+UCI_DATA_FILE = "household_power_consumption.txt"
 
 
 @dataclass(frozen=True)
@@ -162,6 +169,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
     "sgd": ModelSpec("large_scale", "SGDRegressor + StandardScaler", build_sgd),
     "lightgbm": ModelSpec("large_scale", "LightGBM", build_lightgbm),
     "xgboost": ModelSpec("large_scale", "XGBoost", build_xgboost),
+    "lstm": ModelSpec("nn", "PyTorch LSTMRegressor"),
 }
 
 
@@ -170,6 +178,11 @@ def parse_args() -> argparse.Namespace:
         description="Forecast Global_active_power with classical ML models, including XGBoost.",
     )
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH, help="Path to household_power_consumption.txt")
+    parser.add_argument(
+        "--download-if-missing",
+        action="store_true",
+        help="Download the UCI open dataset when --data-path does not exist.",
+    )
     parser.add_argument("--freq", default=DEFAULT_FREQ, help="Resample interval, for example 30min, 1h, or 1D.")
     parser.add_argument("--agg", choices=("mean", "sum", "median"), default=DEFAULT_AGG, help="Resample aggregation.")
     parser.add_argument("--target", default=DEFAULT_TARGET, help="Target column to forecast.")
@@ -186,8 +199,33 @@ def parse_args() -> argparse.Namespace:
         help="Holdout ratio. Must satisfy 0 < test_size < 1.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("."), help="Directory where outputs will be saved.")
+    parser.add_argument("--lstm-lookback", default="7D", help="LSTM lookback window, for example 24h or 7D.")
+    parser.add_argument("--lstm-epochs", type=int, default=12, help="Training epochs for --model lstm.")
+    parser.add_argument("--lstm-batch-size", type=int, default=256, help="Batch size for --model lstm.")
+    parser.add_argument("--lstm-hidden-size", type=int, default=64, help="Hidden size for --model lstm.")
+    parser.add_argument("--lstm-layers", type=int, default=2, help="Number of recurrent layers for --model lstm.")
+    parser.add_argument("--lstm-learning-rate", type=float, default=1e-3, help="Learning rate for --model lstm.")
     parser.add_argument("--list-models", action="store_true", help="Print available models and exit.")
     return parser.parse_args()
+
+
+def download_household_power_data(data_path: Path, url: str = UCI_DATA_URL) -> Path:
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    zip_path = data_path.with_suffix(".zip")
+
+    print(f"Downloading open dataset from UCI: {url}")
+    urllib.request.urlretrieve(url, zip_path)
+
+    with zipfile.ZipFile(zip_path) as archive:
+        members = {Path(name).name: name for name in archive.namelist()}
+        if UCI_DATA_FILE not in members:
+            raise FileNotFoundError(f"{UCI_DATA_FILE} was not found in {zip_path}.")
+
+        with archive.open(members[UCI_DATA_FILE]) as source, data_path.open("wb") as target:
+            target.write(source.read())
+
+    print(f"Saved dataset to {data_path}")
+    return data_path
 
 
 def sanitize_token(value: str) -> str:
@@ -251,11 +289,14 @@ def print_models() -> None:
         print(f"  - {name:<14} [{spec.family:<16}] {spec.description}")
 
 
-def load_household_power_data(data_path: Path) -> pd.DataFrame:
+def load_household_power_data(data_path: Path, download_if_missing: bool = False) -> pd.DataFrame:
     if not data_path.exists():
-        raise FileNotFoundError(
-            f"{data_path} was not found. Download household_power_consumption.txt from UCI and place it here."
-        )
+        if download_if_missing:
+            download_household_power_data(data_path)
+        else:
+            raise FileNotFoundError(
+                f"{data_path} was not found. Run `python fetch_open_data.py` or pass `--download-if-missing`."
+            )
 
     df = pd.read_csv(data_path, sep=";", na_values=["?"], low_memory=False)
     df["datetime"] = pd.to_datetime(
@@ -322,7 +363,10 @@ def make_features(
 
 
 def build_model(model_name: str) -> object:
-    return MODEL_SPECS[model_name].factory()
+    factory = MODEL_SPECS[model_name].factory
+    if factory is None:
+        raise ValueError(f"{model_name} is not a scikit-learn style model.")
+    return factory()
 
 
 def split_train_test(
@@ -351,6 +395,112 @@ def evaluate_predictions(y_true: pd.Series, y_pred: np.ndarray | pd.Series) -> d
     mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     return {"mae": float(mae), "rmse": float(rmse)}
+
+
+def import_torch() -> object:
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError(
+            "torch is not installed. Run `.\\.venv\\Scripts\\python.exe -m pip install torch`."
+        ) from exc
+    return torch
+
+
+def build_lstm_module(torch: object, input_size: int, hidden_size: int, num_layers: int) -> object:
+    class LSTMRegressor(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            dropout = 0.1 if num_layers > 1 else 0.0
+            self.lstm = torch.nn.LSTM(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=dropout,
+            )
+            head_hidden = max(16, hidden_size // 2)
+            self.head = torch.nn.Sequential(
+                torch.nn.Linear(hidden_size, head_hidden),
+                torch.nn.ReLU(),
+                torch.nn.Linear(head_hidden, 1),
+            )
+
+        def forward(self, x: object) -> object:
+            out, _ = self.lstm(x)
+            return self.head(out[:, -1, :])
+
+    return LSTMRegressor()
+
+
+def make_lstm_sequences(
+    data: pd.DataFrame,
+    target_col: str,
+    lookback_steps: int,
+) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex, list[str]]:
+    feature_cols = list(data.columns)
+    values = data[feature_cols].to_numpy(dtype=np.float32)
+    target_values = data[target_col].to_numpy(dtype=np.float32)
+
+    x = np.stack(
+        [values[idx - lookback_steps : idx] for idx in range(lookback_steps, len(data))],
+        axis=0,
+    )
+    y = target_values[lookback_steps:]
+    index = data.index[lookback_steps:]
+    return x, y, index, feature_cols
+
+
+def predict_lstm_batches(
+    torch: object,
+    model: object,
+    x: np.ndarray,
+    batch_size: int,
+    device: object,
+) -> np.ndarray:
+    preds: list[np.ndarray] = []
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(x), batch_size):
+            batch = torch.from_numpy(x[start : start + batch_size]).to(device)
+            pred = model(batch).detach().cpu().numpy().reshape(-1)
+            preds.append(pred)
+    return np.concatenate(preds)
+
+
+def iterative_forecast_lstm(
+    torch: object,
+    model: object,
+    history: pd.DataFrame,
+    target_col: str,
+    feature_cols: list[str],
+    feature_scaler: StandardScaler,
+    target_scaler: StandardScaler,
+    lookback_steps: int,
+    forecast_steps: int,
+    freq: str,
+    device: object,
+) -> pd.DataFrame:
+    work = history.copy()
+    future_preds: list[tuple[pd.Timestamp, float]] = []
+
+    model.eval()
+    for _ in range(forecast_steps):
+        next_time = work.index[-1] + to_offset(freq)
+        seq_values = work[feature_cols].iloc[-lookback_steps:].to_numpy(dtype=np.float32)
+        seq_scaled = feature_scaler.transform(seq_values).reshape(1, lookback_steps, -1).astype(np.float32)
+
+        with torch.no_grad():
+            pred_scaled = float(model(torch.from_numpy(seq_scaled).to(device)).detach().cpu().numpy()[0, 0])
+
+        pred = float(target_scaler.inverse_transform(np.array([[pred_scaled]], dtype=np.float32))[0, 0])
+        next_row = work.iloc[-1:].copy()
+        next_row.index = [next_time]
+        next_row[target_col] = pred
+        work = pd.concat([work, next_row], axis=0)
+        future_preds.append((next_time, pred))
+
+    return pd.DataFrame(future_preds, columns=["datetime", "forecast"]).set_index("datetime")
 
 
 def iterative_forecast_sklearn(
@@ -431,6 +581,138 @@ def run_sklearn_pipeline(
     return metrics, test_result, future_forecast
 
 
+def run_lstm_pipeline(
+    args: argparse.Namespace,
+    resampled: pd.DataFrame,
+    forecast_steps: int,
+    freq_delta: pd.Timedelta,
+) -> tuple[dict[str, float], pd.DataFrame, pd.DataFrame]:
+    torch = import_torch()
+    torch.manual_seed(42)
+
+    lookback = resolve_step_spec(args.lstm_lookback, freq_delta)
+    if lookback is None:
+        raise ValueError(f"LSTM lookback `{args.lstm_lookback}` must be a multiple of --freq.")
+
+    lookback_label, lookback_steps = lookback
+    if lookback_steps >= len(resampled):
+        raise ValueError("LSTM lookback window is longer than the available data.")
+
+    print(f"Resolved LSTM lookback: {lookback_label}={lookback_steps} steps")
+    x_raw, y_raw, index, feature_cols = make_lstm_sequences(resampled, args.target, lookback_steps)
+    split_idx = int(len(x_raw) * (1 - args.test_size))
+    if split_idx <= 0 or split_idx >= len(x_raw):
+        raise ValueError("Train or test split became empty. Adjust test_size.")
+
+    feature_scaler = StandardScaler()
+    target_scaler = StandardScaler()
+    n_features = x_raw.shape[-1]
+    feature_scaler.fit(x_raw[:split_idx].reshape(-1, n_features))
+    target_scaler.fit(y_raw[:split_idx].reshape(-1, 1))
+
+    x_scaled = feature_scaler.transform(x_raw.reshape(-1, n_features)).reshape(x_raw.shape).astype(np.float32)
+    y_scaled = target_scaler.transform(y_raw.reshape(-1, 1)).astype(np.float32)
+
+    x_train_all = x_scaled[:split_idx]
+    y_train_all = y_scaled[:split_idx]
+    x_test = x_scaled[split_idx:]
+    y_test = y_raw[split_idx:]
+    test_index = index[split_idx:]
+
+    val_size = max(1, int(len(x_train_all) * 0.1))
+    x_train = x_train_all[:-val_size]
+    y_train = y_train_all[:-val_size]
+    x_val = x_train_all[-val_size:]
+    y_val = y_train_all[-val_size:]
+
+    print("LSTM feature shape:", x_scaled.shape)
+    print("Train:", x_train.shape, y_train.shape)
+    print("Validation:", x_val.shape, y_val.shape)
+    print("Test :", x_test.shape, y_test.shape)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_lstm_module(
+        torch=torch,
+        input_size=n_features,
+        hidden_size=args.lstm_hidden_size,
+        num_layers=args.lstm_layers,
+    ).to(device)
+
+    train_dataset = torch.utils.data.TensorDataset(
+        torch.from_numpy(x_train),
+        torch.from_numpy(y_train),
+    )
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.lstm_batch_size,
+        shuffle=True,
+    )
+
+    criterion = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lstm_learning_rate)
+    best_state = None
+    best_val_loss = float("inf")
+    patience = 3
+    bad_epochs = 0
+
+    print(f"Training model: lstm ({MODEL_SPECS['lstm'].description}) on {device}")
+    for epoch in range(1, args.lstm_epochs + 1):
+        model.train()
+        train_losses: list[float] = []
+        for batch_x, batch_y in train_loader:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(batch_x), batch_y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_losses.append(float(loss.detach().cpu()))
+
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(torch.from_numpy(x_val).to(device))
+            val_loss = float(criterion(val_pred, torch.from_numpy(y_val).to(device)).detach().cpu())
+
+        train_loss = float(np.mean(train_losses))
+        print(f"Epoch {epoch:02d}/{args.lstm_epochs} - train_loss={train_loss:.5f} val_loss={val_loss:.5f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                print(f"Early stopping after {epoch} epochs.")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.to(device)
+
+    pred_scaled = predict_lstm_batches(torch, model, x_test, args.lstm_batch_size, device)
+    pred_test = target_scaler.inverse_transform(pred_scaled.reshape(-1, 1)).reshape(-1)
+    y_test_series = pd.Series(y_test, index=test_index, name=args.target)
+    metrics = evaluate_predictions(y_test_series, pred_test)
+    test_result = pd.DataFrame({"actual": y_test_series, "pred": pred_test}, index=test_index)
+
+    future_forecast = iterative_forecast_lstm(
+        torch=torch,
+        model=model,
+        history=resampled.copy(),
+        target_col=args.target,
+        feature_cols=feature_cols,
+        feature_scaler=feature_scaler,
+        target_scaler=target_scaler,
+        lookback_steps=lookback_steps,
+        forecast_steps=forecast_steps,
+        freq=args.freq,
+        device=device,
+    )
+    return metrics, test_result, future_forecast
+
+
 def save_outputs(
     output_dir: Path,
     model_name: str,
@@ -468,7 +750,7 @@ def main() -> None:
     window_specs, skipped_windows = resolve_specs(DEFAULT_WINDOW_SPECS, freq_delta)
 
     print("Loading data...")
-    df = load_household_power_data(args.data_path)
+    df = load_household_power_data(args.data_path, download_if_missing=args.download_if_missing)
     print("Raw shape:", df.shape)
 
     if args.target not in df.columns:
@@ -477,15 +759,23 @@ def main() -> None:
     resampled = resample_data(df, args.freq, args.agg)
     print(f"Resampled shape ({args.freq}, {args.agg}):", resampled.shape)
 
-    metrics, test_result, future_forecast = run_sklearn_pipeline(
-        args=args,
-        resampled=resampled,
-        lag_specs=lag_specs,
-        window_specs=window_specs,
-        skipped_lags=skipped_lags,
-        skipped_windows=skipped_windows,
-        forecast_steps=forecast_steps,
-    )
+    if args.model == "lstm":
+        metrics, test_result, future_forecast = run_lstm_pipeline(
+            args=args,
+            resampled=resampled,
+            forecast_steps=forecast_steps,
+            freq_delta=freq_delta,
+        )
+    else:
+        metrics, test_result, future_forecast = run_sklearn_pipeline(
+            args=args,
+            resampled=resampled,
+            lag_specs=lag_specs,
+            window_specs=window_specs,
+            skipped_lags=skipped_lags,
+            skipped_windows=skipped_windows,
+            forecast_steps=forecast_steps,
+        )
 
     print(f"MAE : {metrics['mae']:.4f}")
     print(f"RMSE: {metrics['rmse']:.4f}")
